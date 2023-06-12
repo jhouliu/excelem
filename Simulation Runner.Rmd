@@ -1,0 +1,852 @@
+---
+title: "Simulation Study"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(pbapply);library(tidyverse);library(scales);library(forcats)
+scaler.maker = function(x = 0, factor = 10) {
+  maxima = max(x)
+  transform = function(x) -log10(-(x - maxima) + 10^(-factor)) - factor
+  inverse = function(x) 10^(-factor) - 10^(-factor - x) + maxima
+  breaks = function(x, n = nbreaks) {
+    minima = min(x)
+    return(inverse(seq(transform(minima), 0, length.out = n)))
+  }
+  scales::trans_new(
+    name = "myscale",
+    transform = transform,
+    inverse = inverse,
+    breaks = breaks,
+    domain = c(-Inf, maxima)
+  )
+}
+
+scale_y_pseudolog = function(factor = 10) {
+  scale_y_continuous(
+    trans = scaler.maker(factor = factor),
+    breaks = c(0, -1e-8, -1e-4, -1e0),
+    minor_breaks = 0,
+    labels = trans_format(
+      function(x) - round(-log10(-x)),
+      function(x) ifelse(x == -Inf, "0", math_format(10 ^ .x)(x))
+    )
+  )
+}
+
+head.or.na = function(x, n) {if (is.na(n)) return(NA) else head(x, n)}
+tail.1 = function(x) {y = tail(x, 1); if (length(y) == 1) y else NA}
+max.or.na = function(x) {x = na.omit(x); if (length(x) == 0) return(NA) else max(x)}
+getorNA = function(x, ind) {y = x[ind]; if (length(y) == 1L) y else NA}
+```
+
+# Initialize Clusters
+
+```{r}
+library(parallel)
+library(pbapply)
+try(stopCluster(cl))
+cl = makeCluster(min(detectCores(), 120))
+invisible(clusterEvalQ(cl, {
+  rm(list = ls())
+  library(excelem)
+  # source("Simulation Functions.R", local = TRUE);
+  invisible(NULL)
+}))
+pboptions(use_lb = TRUE, nout = 1)
+```
+
+# FA Simulation
+
+```{r}
+set.seed(1)
+params.FA = expand.grid(
+  n = c(1000, 2000, 3000),
+  p = c(8, 10),
+  q = c(4, 6),
+  sd = c(0.5, 1, 2),
+  rep = 1:100
+)
+params.FA$seed = sample.int(2147483647L, nrow(params.FA))
+
+sim.FA = pbapply(cl = cl, simplify = FALSE, params.FA, 1, function(par) {
+  dat = gen.data.FA(n = par[['n']], p = par[['p']], q = par[['q']], sd = par[['sd']], seed = par[['seed']])
+  dat = scale(dat)
+  init = init.par.FA(dat, par[['q']])
+  
+  aem.FA = tryCatch(accelerated.em(
+    dat, init, 
+    e.step.FA, m.step.FA, mix.step.FA, loglik.FA,
+    iters = 10000, pre.em = 100
+  ), error = function(e) e)
+  
+  em.FA = tryCatch(accelerated.em(
+    dat, init, 
+    e.step.FA, m.step.FA, mix.step.FA, loglik.FA,
+    iters = 10000, pre.em = Inf
+  ), error = function(e) e)
+  
+  aecme.FA = tryCatch(accelerated.em(
+    dat, init,
+    e.step.FA, cm.step.FA, mix.step.FA, loglik.FA,
+    iters = 10000, pre.em = 100
+  ), error = function(e) e)
+
+  ecme.FA = tryCatch(accelerated.em(
+    dat, init,
+    e.step.FA, cm.step.FA, mix.step.FA, loglik.FA,
+    iters = 10000, pre.em = Inf
+  ), error = function(e) e)
+  
+  sq.em.FA = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.FA, m.step.FA, loglik.FA, fixpt.par.wrap.FA, fixpt.par.unwrap.FA,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sq.ecme.FA = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.FA, cm.step.FA, loglik.FA, fixpt.par.wrap.FA, fixpt.par.unwrap.FA,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sqp.em.FA = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.FA, m.step.FA, loglik.FA, fixpt.par.wrap.2.FA, fixpt.par.unwrap.2.FA,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sqp.ecme.FA = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.FA, cm.step.FA, loglik.FA, fixpt.par.wrap.2.FA, fixpt.par.unwrap.2.FA,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  list("aEM" = aem.FA, "aECME" = aecme.FA,
+       "EM" = em.FA, "ECME" = ecme.FA,
+       "sqEM" = sq.em.FA, "sqECME" = sq.ecme.FA,
+       "sqpEM" = sqp.em.FA, "sqpECME" = sqp.ecme.FA)
+})
+
+# Reduce file size by removing large unused elements
+for (i in seq_along(sim.FA)) {
+  for (j in seq_along(sim.FA[[i]])) {
+    try({sim.FA[[i]][[j]]$update = NULL})
+    try({sim.FA[[i]][[j]]$alpha.trace = NULL})
+  }
+}
+
+save(params.FA, sim.FA, file = format(Sys.time(), "%Y-%m-%d %Hh%Mm%Ss FA.rdata"))
+```
+
+# GMM Simulation
+
+```{r}
+set.seed(1)
+params.GMM = expand.grid(
+  n = c(1000, 2000, 3000),
+  d = c(2, 3, 4),
+  sigma = c(0.5, 1, 2),
+  rep = 1:100
+)
+params.GMM$seed = sample.int(2147483647L, nrow(params.GMM))
+
+sim.GMM = pbapply(cl = cl, simplify = FALSE, params.GMM, 1, function(par) {
+  dat = gen.data.GMM(n = par['n'], d = par['d'], sigma = par['sigma'], seed = par['seed'])
+  init = init.par.GMM(dat, 2^par['d'])
+  
+  aem.GMM = tryCatch(accelerated.em(
+    dat, init, 
+    e.step.GMM, m.step.GMM, mix.step.GMM, loglik.GMM,
+    iters = 10000, pre.em = 100
+  ), error = function(e) NA)
+  
+  em.GMM = tryCatch(accelerated.em(
+    dat, init, 
+    e.step.GMM, m.step.GMM, mix.step.GMM, loglik.GMM,
+    iters = 10000, pre.em = Inf
+  ), error = function(e) NA)
+   
+  sq.em.GMM = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.GMM, m.step.GMM, loglik.GMM, fixpt.par.wrap.GMM, fixpt.par.unwrap.GMM,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+
+  sqp.em.GMM = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.GMM, m.step.GMM, loglik.GMM, fixpt.par.wrap.2.GMM, fixpt.par.unwrap.2.GMM,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  list(EM = em.GMM, aEM = aem.GMM, sqEM = sq.em.GMM, sqpEM = sqp.em.GMM)
+})
+
+# Reduce file size by removing large unused elements
+for (i in seq_along(sim.GMM)) {
+  for (j in seq_along(sim.GMM[[i]])) {
+    try({sim.GMM[[i]][[j]]$par$logwts = NULL})
+    try({sim.GMM[[i]][[j]]$par$zhat = NULL})
+    try({sim.GMM[[i]][[j]]$update = NULL})
+    try({sim.GMM[[i]][[j]]$alpha.trace = NULL})
+  }
+}
+
+save(params.GMM, sim.GMM, file = format(Sys.time(), "%Y-%m-%d %Hh%Mm%Ss GMM.rdata"))
+```
+
+# VC Simulation
+
+```{r}
+set.seed(1)
+params.VC3 = expand.grid(
+  groups = c(2, 3, 4),
+  nj = 100,
+  p = 2,
+  q = 2,
+  noise.sigmasq = c(0.5, 1, 2),
+  rep = 1:100
+)
+params.VC3$seed = sample.int(2147483647L, nrow(params.VC3))
+
+sim.VC3 = pbapply(cl = cl, simplify = FALSE, params.VC3, 1, function(par) {
+  dat = gen.data.VC3(groups = par[['groups']], 
+                     nj = rep(par[['nj']], par[['groups']]),
+                     p = par[['p']], q = par[['q']],
+                     noise.sigmasq = par[['noise.sigmasq']],
+                     seed = par[['seed']])
+  init = init.par.VC3(dat)
+  
+  aem.VC3 = tryCatch(accelerated.em(
+    dat, init, 
+    e.step.VC3, m.step.VC3, mix.step.VC3, loglik.VC3,
+    iters = 10000, pre.em = 100
+  ), error = function(e) e)
+  
+  em.VC3 = tryCatch(accelerated.em(
+    dat, init, 
+    e.step.VC3, m.step.VC3, mix.step.VC3, loglik.VC3,
+    iters = 10000, pre.em = Inf
+  ), error = function(e) e)
+  
+  aecme1.VC3 = tryCatch(accelerated.em(
+    dat, init,
+    e.step.VC3, cm1.step.VC3, mix.step.VC3, loglik.VC3,
+    iters = 10000, pre.em = 100
+  ), error = function(e) e)
+  
+  ecme1.VC3 = tryCatch(accelerated.em(
+    dat, init,
+    e.step.VC3, cm1.step.VC3, mix.step.VC3, loglik.VC3,
+    iters = 10000, pre.em = Inf
+  ), error = function(e) e)
+  
+  aecme2.VC3 = tryCatch(accelerated.em(
+    dat, init,
+    e.step.VC3, cm2.step.VC3, mix.step.VC3, loglik.VC3,
+    iters = 10000, pre.em = 100
+  ), error = function(e) e)
+  
+  ecme2.VC3 = tryCatch(accelerated.em(
+    dat, init,
+    e.step.VC3, cm2.step.VC3, mix.step.VC3, loglik.VC3,
+    iters = 10000, pre.em = Inf
+  ), error = function(e) e)
+    
+  sq.em.VC3 = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.VC3, m.step.VC3, loglik.VC3, fixpt.par.wrap.VC3, fixpt.par.unwrap.VC3,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sq.ecme1.VC3 = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.VC3, cm1.step.VC3, loglik.VC3, fixpt.par.wrap.VC3, fixpt.par.unwrap.VC3,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sq.ecme2.VC3 = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.VC3, cm2.step.VC3, loglik.VC3, fixpt.par.wrap.VC3, fixpt.par.unwrap.VC3,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sq2.em.VC3 = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.VC3, m.step.VC3, loglik.VC3, fixpt.par.wrap.2.VC3, fixpt.par.unwrap.2.VC3,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sq2.ecme1.VC3 = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.VC3, cm1.step.VC3, loglik.VC3, fixpt.par.wrap.2.VC3, fixpt.par.unwrap.2.VC3,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  sq2.ecme2.VC3 = tryCatch(squarem.wrapper(
+    dat, init,
+    e.step.VC3, cm2.step.VC3, loglik.VC3, fixpt.par.wrap.2.VC3, fixpt.par.unwrap.2.VC3,
+    maxiter = 10000, objfn.inc = 0
+  ), error = function(e) e)
+  
+  list("aEM" = aem.VC3, "EM" = em.VC3,
+       "aECME1" = aecme1.VC3, "ECME1" = ecme1.VC3,
+       "aECME2" = aecme2.VC3, "ECME2" = ecme2.VC3,
+       "sqEM" = sq.em.VC3, "sqECME1" = sq.ecme1.VC3, "sqECME2" = sq.ecme2.VC3,
+       "sqpEM" = sq2.em.VC3, "sqpECME1" = sq2.ecme1.VC3, "sqpECME2" = sq2.ecme2.VC3)
+})
+
+# Reduce file size by removing large unused elements
+for (i in seq_along(sim.VC3)) {
+  for (j in seq_along(sim.VC3[[i]])) {
+    sim.VC3[[i]][[j]]$par[c("XtX", "ZtZ", "XtZ", "Zty", "Xty", "sumXtX", "sumXty", "invsumXtX", "Xbeta", "invD", "shortcut1", "E")] = NULL
+    sim.VC3[[i]][[j]][c("update", "alpha.trace")] = NULL
+  }
+}
+
+save(params.VC3, sim.VC3, file = format(Sys.time(), "%Y-%m-%d %Hh%Mm%Ss VC3.rdata"), compress = 'xz')
+```
+
+
+# GMM Analysis
+
+## Generate data.df
+
+```{r}
+data.list = pblapply(1:nrow(params.GMM), function(i) {
+  L = sim.GMM[[i]]
+  df = tibble(
+    id = i,
+    ll = lapply(L, function(x) tryCatch(x$loglik.trace, error = function(e) NA)),
+    time = lapply(L, function(x) tryCatch(cumsum(x$timing), error = function(e) NA)),
+    conv = unname(sapply(L, function(x) tryCatch(isTRUE(x$converged), error = function(e) NA))),
+    Method = names(L)
+  )
+  df %>% bind_cols(params.GMM[i,]) -> df
+  return(df)
+})
+data.df = bind_rows(data.list)
+data.df %>% select(-seed) %>% mutate(across(c(n, d), as.integer)) -> data.df
+
+data.df %>%
+  filter(!startsWith(Method, "sq")) %>%
+  mutate(
+    stop.iter = map_int(ll, function(ll) {
+      tryCatch({d = diff(ll); x = which(d > 0 & d < 1e-10)[1]; if (is.na(x)) length(ll) else x},
+               error = function(e) NA)}),
+    conv = stop.iter < map_int(ll, length),
+    time = map2(time, stop.iter, head),
+    ll = map2(ll, stop.iter, head),
+    max.ll = map2_dbl(ll, stop.iter, getorNA),
+    stop.time = map2_dbl(time, stop.iter, getorNA)
+  ) %>%
+  bind_rows(
+    data.df %>%
+      filter(startsWith(Method, "sq")) %>%
+      mutate(
+        stop.iter = map_int(ll, length),
+        max.ll = map2_dbl(ll, stop.iter, getorNA),
+        stop.time = map2_dbl(time, stop.iter, getorNA)
+      )
+  ) %>%
+  group_by(id) %>%
+  mutate(id.max.ll = max(max.ll, na.rm = TRUE), 
+         max.ll = max.ll - id.max.ll) %>%
+  ungroup() %>% 
+  mutate(
+    ll.mod = map2(ll, id.max.ll, `-`),
+    near.optima = max.ll > -1e-8,
+    grossly.suboptimal = max.ll < -1e-4
+  ) %>% 
+  group_by(id) %>% 
+  mutate(all.near.optima = all(conv & near.optima)) %>%
+  ungroup() %>% 
+  mutate(
+    Method = case_when(
+      startsWith(Method, "a") ~ paste0("Leapfrog-", substr(Method, 2, 100)),
+      startsWith(Method, "sqp") ~ paste0("SQUAREM-", substr(Method, 4, 100), "-T"),
+      startsWith(Method, "sq") ~ paste0("SQUAREM-", substr(Method, 3, 100)),
+      .default = Method
+    ),
+    type = case_when(
+      conv & all.near.optima ~ "1) All Near-Optima",
+      conv & near.optima ~ "2) Near-Optima",
+      conv & !grossly.suboptimal ~ "3) Sub-Optimal",
+      conv & grossly.suboptimal ~ "4) Very Sub-Optimal",
+      .default = "5) Did Not Converge"
+    )
+  ) %>% 
+  select(-ll, -id.max.ll, 
+         -rep, -conv, -near.optima, 
+         -all.near.optima, -grossly.suboptimal) -> data.df.2
+```
+
+## Convergence Table and Plot
+
+```{r}
+data.df.2 %>% count(type, Method, name = "count") %>% 
+  pivot_wider(names_from = Method, values_from = count, values_fill = 0) -> temp
+
+print(temp)
+temp %>% select(type, ends_with("EM") | ends_with("EM-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+temp %>% select(type, ends_with("ECME") | ends_with("ECME-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+
+data.df.2 %>% 
+  mutate(
+    Method = fct_reorder(Method, type, function(x) {sum(startsWith(x, "2)") | startsWith(x, "1)"))}, .na_rm = TRUE)
+  ) %>% 
+  ggplot(aes(x = Method, fill = type)) + 
+  geom_bar() + 
+  facet_grid(paste0("\u03c3² = ", sigma) ~ paste0("d = ", d)) +
+  scale_fill_brewer(palette = "Reds") + 
+  labs(x = "", y = "Frequency", fill = "") +
+  theme_bw() + 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )+
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  coord_flip()
+
+ggsave("t:/gmm_convergence_by_par.pdf", device = cairo_pdf, width = 6, height = 8, dpi = 300)
+```
+
+## Wall-Clock Time Boxplot
+
+```{r}
+data.df.2 %>% 
+  mutate(
+    tot.time = map_dbl(time, \(x) {y = tail(x, 1); if (length(y) == 1) y else NA}),
+    Method = fct_reorder(factor(Method), -tot.time, mean, .na_rm = TRUE)
+  ) %>% 
+  group_by(Method) %>% mutate(mean.time = mean(tot.time, na.rm = TRUE)) %>% 
+  ggplot(aes(x = Method, y = tot.time, fill = -mean.time)) + 
+  geom_violin(scale = "width") + 
+  scale_y_log10(labels = math_format(.x)) +
+  labs(x = "", y = "Wall-Clock Time (seconds)", fill = "") +
+  guides(fill = "none") + theme_bw() + theme() + coord_flip()
+ggsave("t:/gmm_time_boxplot.pdf", device = pdf, width = 6, height = 4, dpi = 300)
+```
+
+## Wall-Clock Log-Lik Boxplot
+
+```{r}
+data.df.2 %>% 
+  mutate(
+    Method = fct_reorder(factor(Method), max.ll, mean, .na_rm = TRUE)
+  ) %>% 
+  group_by(Method) %>% mutate(mean.time = mean(max.ll, na.rm = TRUE)) %>% 
+  ggplot(aes(x = Method, y = max.ll, fill = mean.time)) + 
+  geom_violin(scale = "width") + 
+  scale_y_continuous(trans = scaler.maker(0, factor = 10, nbreaks = 5),
+                     minor_breaks = 0,
+                     breaks = c(0, -1e-8, -1e-4, -1e0),
+                     labels = trans_format(function(x) -round(-log10(-x)),
+                                           function(x) ifelse(x == -Inf, "0", math_format(10^.x)(x)))) +
+  labs(x = "", y = "Log-Likelihood \u0394max", fill = "") +
+  guides(fill = "none") + theme_bw() + theme() + coord_flip()
+ggsave("t:/gmm_maxll_boxplot.pdf", device = cairo_pdf, width = 6, height = 3, dpi = 300)
+```
+
+## Time vs Log-Likelihood Scatterplot
+
+```{r}
+data.df.2 %>% 
+  mutate(Method = fct_reorder(Method, Method, function(x) {
+    y = 1 * grepl("EM(-T|$)", x) + 2 * grepl("ECME1(-T|$)", x) + 3 * grepl("ECME2(-T|$)", x) +
+        0.1 * grepl("Leapfrog", x) + 10 * grepl("SQUAREM", x) +
+        0.1 * grepl("-T", x)
+    mean(y)
+  })) %>% 
+  ggplot(aes(x = stop.time, y = max.ll, colour = Method)) +
+  geom_point(alpha = 0.5) +
+  scale_y_continuous(trans = scaler.maker(0, factor = 10, nbreaks = 5),
+                   minor_breaks = 0,
+                   breaks = c(0, -1e-8, -1e-4, -1e0),
+                   labels = trans_format(function(x) -round(-log10(-x)),
+                                         function(x) ifelse(x == -Inf, "0", math_format(10^.x)(x)))) +
+  scale_x_log10(labels = math_format(.x)) +
+  scale_colour_brewer(palette = "Paired") +
+  labs(x = "Wall-Clock Time (seconds)", y = "Log-Likelihood Δmax", colour = "") +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.spacing.x = unit(0, "mm"),
+    legend.spacing.y = unit(0, "mm")
+  ) +
+  facet_grid(. ~ case_when(grepl("SQUAREM", Method) ~ "c) SQUAREM",
+                         grepl("Leapfrog", Method) ~ "b) Leapfrog",
+                         .default = "a) Unaccelerated")) + 
+  guides(colour = guide_legend(nrow = 2, override.aes = list(alpha = 1)))
+ggsave("t:/gmm_time_vs_deltamax.png", width = 6, height = 4, dpi = 300)
+```
+
+
+# VC3 Analysis
+
+## Generate data.df
+
+```{r}
+data.list = pblapply(1:nrow(params.VC3), function(i) {
+  L = sim.VC3[[i]]
+  df = tibble(
+    id = i,
+    ll = lapply(L, function(x) tryCatch(x$loglik.trace, error = function(e) NA)),
+    time = lapply(L, function(x) tryCatch(cumsum(x$timing), error = function(e) NA)),
+    conv = unname(sapply(L, function(x) tryCatch(isTRUE(x$converged), error = function(e) NA))),
+    Method = names(L)
+  )
+  df %>% bind_cols(params.VC3[i,]) -> df
+  return(df)
+})
+data.df = bind_rows(data.list)
+data.df %>% select(-seed) %>% mutate(across(c(groups, nj, p, q), as.integer)) -> data.df
+
+data.df %>%
+  filter(!startsWith(Method, "sq")) %>%
+  mutate(
+    stop.iter = map_int(ll, function(ll) {
+      tryCatch({d = diff(ll); x = which(d > 0 & d < 1e-10)[1]; if (is.na(x)) length(ll) else x},
+               error = function(e) NA)}),
+    conv = stop.iter < map_int(ll, length),
+    time = map2(time, stop.iter, head),
+    ll = map2(ll, stop.iter, head),
+    max.ll = map2_dbl(ll, stop.iter, getorNA),
+    stop.time = map2_dbl(time, stop.iter, getorNA)
+  ) %>%
+  bind_rows(
+    data.df %>%
+      filter(startsWith(Method, "sq")) %>%
+      mutate(
+        stop.iter = map_int(ll, length),
+        max.ll = map2_dbl(ll, stop.iter, getorNA),
+        stop.time = map2_dbl(time, stop.iter, getorNA)
+      )
+  ) %>%
+  group_by(id) %>%
+  mutate(id.max.ll = max(max.ll, na.rm = TRUE), 
+         max.ll = max.ll - id.max.ll) %>%
+  ungroup() %>% 
+  mutate(
+    ll.mod = map2(ll, id.max.ll, `-`),
+    near.optima = max.ll > -1e-8,
+    grossly.suboptimal = max.ll < -1e-4
+  ) %>% 
+  group_by(id) %>% 
+  mutate(all.near.optima = all(conv & near.optima)) %>%
+  ungroup() %>% 
+  mutate(
+    Method = case_when(
+      startsWith(Method, "a") ~ paste0("Leapfrog-", substr(Method, 2, 100)),
+      startsWith(Method, "sqp") ~ paste0("SQUAREM-", substr(Method, 4, 100), "-T"),
+      startsWith(Method, "sq") ~ paste0("SQUAREM-", substr(Method, 3, 100)),
+      .default = Method
+    ),
+    type = case_when(
+      conv & all.near.optima ~ "1) All Near-Optima",
+      conv & near.optima ~ "2) Near-Optima",
+      conv & !grossly.suboptimal ~ "3) Sub-Optimal",
+      conv & grossly.suboptimal ~ "4) Very Sub-Optimal",
+      .default = "5) Did Not Converge"
+    )
+  ) %>% 
+  select(-ll, -id.max.ll, 
+         -rep, -conv, -near.optima, 
+         -all.near.optima, -grossly.suboptimal) -> data.df.2
+```
+
+## Convergence Table and Plot
+
+```{r}
+data.df.2 %>% count(type, Method, name = "count") %>% 
+  pivot_wider(names_from = Method, values_from = count, values_fill = 0) -> temp
+
+print(temp)
+temp %>% select(type, ends_with("EM") | ends_with("EM-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+temp %>% select(type, ends_with("ECME1") | ends_with("ECME1-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+temp %>% select(type, ends_with("ECME2") | ends_with("ECME2-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+
+data.df.2 %>% 
+  mutate(
+    Method = fct_reorder(Method, type, function(x) {sum(startsWith(x, "2)") | startsWith(x, "1)"))}, .na_rm = TRUE)
+  ) %>% 
+  ggplot(aes(x = Method, fill = type)) + 
+  geom_bar() + 
+  facet_grid(paste0("\u03C3² = ", noise.sigmasq) ~ paste0("m = ", groups)) +
+  scale_fill_brewer(palette = "Reds") + 
+  labs(x = "", y = "Frequency", fill = "") +
+  theme_bw() + 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )+
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  coord_flip()
+
+ggsave("t:/vc_convergence_by_par.pdf", device = cairo_pdf, width = 6, height = 8, dpi = 300)
+```
+
+## Wall-Clock Time Boxplot
+
+```{r}
+data.df.2 %>% 
+  mutate(
+    tot.time = map_dbl(time, \(x) {y = tail(x, 1); if (length(y) == 1) y else NA}),
+    Method = fct_reorder(factor(Method), -tot.time, mean, .na_rm = TRUE),
+  ) %>% 
+  mutate(type = case_when(
+    type == "1) All Near-Optima" ~ "Near-Optima",
+    type == "2) Near-Optima" ~ "Near-Optima",
+    type == "3) Sub-Optimal" ~ "Sub-Optimal",
+    type == "4) Very Sub-Optimal" ~ "Sub-Optimal",
+    # .default = type
+    .default = "Non-Convergent"
+  )) %>% 
+  group_by(Method) %>% mutate(mean.time = mean(tot.time)) %>% 
+  ggplot(aes(x = Method, y = tot.time, fill = -mean.time)) + 
+  geom_violin() + 
+  scale_y_log10(labels = math_format(.x)) +
+  labs(x = "", y = "Wall-Clock Time (seconds)", fill = "") +
+  guides(fill = "none") + theme_bw() + theme() + coord_flip()
+ggsave("t:/vc_time_boxplot.pdf", device = cairo_pdf, width = 6, height = 3, dpi = 300)
+```
+
+## Wall-Clock Log-Lik Boxplot
+
+```{r}
+data.df.2 %>% 
+  mutate(
+    Method = fct_reorder(factor(Method), max.ll, mean, .na_rm = TRUE)
+  ) %>% 
+  group_by(Method) %>% mutate(mean.time = mean(max.ll)) %>% 
+  ggplot(aes(x = Method, y = max.ll, fill = mean.time)) + 
+  geom_violin(scale = "width") + 
+  scale_y_continuous(trans = scaler.maker(0, factor = 10, nbreaks = 5),
+                     minor_breaks = 0,
+                     breaks = c(0, -1e-8, -1e-4, -1e0),
+                     labels = trans_format(function(x) -round(-log10(-x)),
+                                           function(x) ifelse(x == -Inf, "0", math_format(10^.x)(x)))) +
+  labs(x = "", y = "Log-Likelihood \u0394max", fill = "") +
+  guides(fill = "none") + theme_bw() + theme() + coord_flip()
+ggsave("t:/vc_maxll_boxplot.pdf", device = cairo_pdf, width = 6, height = 3, dpi = 300)
+```
+
+## Time vs Log-Likelihood Scatterplot
+
+```{r}
+data.df.2 %>% 
+  mutate(Method = fct_reorder(Method, Method, function(x) {
+    y = 1 * grepl("EM(-T|$)", x) + 2 * grepl("ECME1(-T|$)", x) + 3 * grepl("ECME2(-T|$)", x) +
+        0.1 * grepl("Leapfrog", x) + 10 * grepl("SQUAREM", x) +
+        0.1 * grepl("-T", x)
+    mean(y)
+  })) %>% 
+  ggplot(aes(x = stop.time, y = max.ll, colour = Method)) +
+  geom_point(alpha = 0.5) +
+  scale_y_continuous(trans = scaler.maker(0, factor = 10, nbreaks = 5),
+                   minor_breaks = 0,
+                   breaks = c(0, -1e-8, -1e-4, -1e0),
+                   labels = trans_format(function(x) -round(-log10(-x)),
+                                         function(x) ifelse(x == -Inf, "0", math_format(10^.x)(x)))) +
+  scale_x_log10(labels = math_format(.x)) +
+  scale_colour_brewer(palette = "Paired") +
+  labs(x = "Wall-Clock Time (seconds)", y = "Log-Likelihood Δmax", colour = "") +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.spacing.x = unit(0, "mm"),
+    legend.spacing.y = unit(0, "mm")
+  ) +
+  facet_grid(. ~ case_when(grepl("SQUAREM", Method) ~ "c) SQUAREM",
+                         grepl("Leapfrog", Method) ~ "b) Leapfrog",
+                         .default = "a) Unaccelerated")) + 
+  guides(colour = guide_legend(nrow = 4, override.aes = list(alpha = 1)))
+ggsave("t:/vc_time_vs_deltamax.png", width = 6, height = 4, dpi = 300)
+```
+
+
+# FA Analysis
+
+## Generate data.df
+
+```{r}
+is.heywood = function(par) {
+  tryCatch({min(diag(par$BBt), par$D)}, error = function(e) NA)
+}
+
+data.list = pblapply(1:nrow(params.FA), function(i) {
+  L = sim.FA[[i]]
+  df = tibble(
+    id = i,
+    ll = lapply(L, function(x) tryCatch(x$loglik.trace, error = function(e) NA)),
+    time = lapply(L, function(x) tryCatch(cumsum(x$timing), error = function(e) NA)),
+    conv = unname(sapply(L, function(x) tryCatch(isTRUE(x$converged), error = function(e) NA))),
+    heywood = sapply(L, function(x) is.heywood(x$par)),
+    Method = names(L)
+  )
+  df %>% bind_cols(params.FA[i,]) -> df
+  return(df)
+})
+data.df = bind_rows(data.list)
+data.df %>% select(-seed) %>% mutate(across(c(n, p, q), as.integer)) -> data.df
+
+data.df %>%
+  filter(!startsWith(Method, "sq")) %>%
+  mutate(
+    stop.iter = map_int(ll, function(ll) {
+      tryCatch({d = diff(ll); x = which(d > 0 & d < 1e-10)[1]; if (is.na(x)) length(ll) else x},
+               error = function(e) NA)}),
+    conv = stop.iter < map_int(ll, length),
+    time = map2(time, stop.iter, head),
+    ll = map2(ll, stop.iter, head),
+    max.ll = map2_dbl(ll, stop.iter, getorNA),
+    stop.time = map2_dbl(time, stop.iter, getorNA)
+  ) %>%
+  bind_rows(
+    data.df %>%
+      filter(startsWith(Method, "sq")) %>%
+      mutate(
+        stop.iter = map_int(ll, length),
+        max.ll = map2_dbl(ll, stop.iter, getorNA),
+        stop.time = map2_dbl(time, stop.iter, getorNA)
+      )
+  ) %>%
+  group_by(id) %>%
+  mutate(id.max.ll = max(max.ll, na.rm = TRUE), 
+         max.ll = max.ll - id.max.ll) %>%
+  ungroup() %>% 
+  mutate(
+    ll.mod = map2(ll, id.max.ll, `-`),
+    near.optima = max.ll > -1e-8,
+    grossly.suboptimal = max.ll < -1e-4
+  ) %>% 
+  group_by(id) %>% 
+  mutate(all.near.optima = all(conv & near.optima)) %>%
+  ungroup() %>% 
+  mutate(
+    Method = case_when(
+      startsWith(Method, "a") ~ paste0("Leapfrog-", substr(Method, 2, 100)),
+      startsWith(Method, "sqp") ~ paste0("SQUAREM-", substr(Method, 4, 100), "-T"),
+      startsWith(Method, "sq") ~ paste0("SQUAREM-", substr(Method, 3, 100)),
+      .default = Method
+    ),
+    type = case_when(
+      conv & all.near.optima ~ "1) All Near-Optima",
+      conv & near.optima ~ "2) Near-Optima",
+      conv & !grossly.suboptimal ~ "3) Sub-Optimal",
+      conv & grossly.suboptimal ~ "4) Very Sub-Optimal",
+      .default = "5) Did Not Converge"
+    )
+  ) %>% 
+  select(-ll, -id.max.ll, 
+         -rep, -conv, -near.optima, 
+         -all.near.optima, -grossly.suboptimal) -> data.df.2
+```
+
+## Convergence Table and Plot
+
+```{r}
+data.df.2 %>% count(type, Method, name = "count") %>% 
+  pivot_wider(names_from = Method, values_from = count, values_fill = 0) -> temp
+
+print(temp)
+temp %>% select(type, ends_with("EM") | ends_with("EM-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+temp %>% select(type, ends_with("ECME") | ends_with("ECME-T")) %>% knitr::kable(booktabs = TRUE, format = "latex") %>% print
+
+data.df.2 %>% 
+  mutate(
+    Method = fct_reorder(Method, type, function(x) {sum(startsWith(x, "2)") | startsWith(x, "1)"))}, .na_rm = TRUE)
+  ) %>% 
+  ggplot(aes(x = Method, fill = type)) + 
+  geom_bar() + 
+  facet_grid(paste0("p = ", p, ", q = ", q) ~ paste0("\u03c3² = ", sd)) +
+  scale_fill_brewer(palette = "Reds") + 
+  labs(x = "", y = "Frequency", fill = "") +
+  theme_bw() + 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )+
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  coord_flip()
+
+ggsave("t:/fa_convergence_by_par.pdf", device = cairo_pdf, width = 6, height = 8, dpi = 300)
+```
+
+## Wall-Clock Time Boxplot
+
+```{r}
+data.df.2 %>% 
+  mutate(
+    tot.time = map_dbl(time, \(x) {y = tail(x, 1); if (length(y) == 1) y else NA}),
+    Method = fct_reorder(factor(Method), -tot.time, mean, .na_rm = TRUE)
+  ) %>% 
+  group_by(Method) %>% mutate(mean.time = mean(tot.time)) %>% 
+  ggplot(aes(x = Method, y = tot.time, fill = -mean.time)) + 
+  geom_violin(scale = "width") + 
+  scale_y_log10(labels = math_format(.x)) +
+  labs(x = "", y = "Wall-Clock Time (seconds)", fill = "") +
+  guides(fill = "none") + theme_bw() + theme() + coord_flip()
+ggsave("t:/fa_time_boxplot.pdf", device = cairo_pdf, width = 6, height = 3, dpi = 300)
+```
+
+## Wall-Clock Log-Lik Boxplot
+
+```{r}
+data.df.2 %>% 
+  mutate(
+    Method = fct_reorder(factor(Method), max.ll, mean, .na_rm = TRUE)
+  ) %>% 
+  group_by(Method) %>% mutate(mean.time = mean(max.ll)) %>% 
+  ggplot(aes(x = Method, y = max.ll, fill = mean.time)) + 
+  geom_violin(scale = "width") + 
+  scale_y_continuous(trans = scaler.maker(0, factor = 10, nbreaks = 5),
+                     minor_breaks = 0,
+                     breaks = c(0, -1e-8, -1e-4, -1e0),
+                     labels = trans_format(function(x) -round(-log10(-x)),
+                                           function(x) ifelse(x == -Inf, "0", math_format(10^.x)(x)))) +
+  labs(x = "", y = "Log-Likelihood \u0394max", fill = "") +
+  guides(fill = "none") + theme_bw() + theme() + coord_flip()
+ggsave("t:/fa_maxll_boxplot.pdf", device = cairo_pdf, width = 6, height = 3, dpi = 300)
+```
+
+## Time vs Log-Likelihood Scatterplot
+
+```{r}
+data.df.2 %>% 
+  mutate(Method = fct_reorder(Method, Method, function(x) {
+    y = 1 * grepl("EM(-T|$)", x) + 2 * grepl("ECME1(-T|$)", x) + 3 * grepl("ECME2(-T|$)", x) +
+        0.1 * grepl("Leapfrog", x) + 10 * grepl("SQUAREM", x) +
+        0.1 * grepl("-T", x)
+    mean(y)
+  })) %>% 
+  ggplot(aes(x = stop.time, y = max.ll, colour = Method)) +
+  geom_point(alpha = 0.5) +
+  scale_y_continuous(trans = scaler.maker(0, factor = 10, nbreaks = 5),
+                   minor_breaks = 0,
+                   breaks = c(0, -1e-8, -1e-4, -1e0),
+                   labels = trans_format(function(x) -round(-log10(-x)),
+                                         function(x) ifelse(x == -Inf, "0", math_format(10^.x)(x)))) +
+  scale_x_log10(labels = math_format(.x)) +
+  scale_colour_brewer(palette = "Paired") +
+  labs(x = "Wall-Clock Time (seconds)", y = "Log-Likelihood Δmax", colour = "") +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.spacing.x = unit(0, "mm"),
+    legend.spacing.y = unit(0, "mm")
+  ) +
+  facet_grid(. ~ case_when(grepl("SQUAREM", Method) ~ "c) SQUAREM",
+                         grepl("Leapfrog", Method) ~ "b) Leapfrog",
+                         .default = "a) Unaccelerated")) + 
+  guides(colour = guide_legend(nrow = 2, override.aes = list(alpha = 1)))
+ggsave("t:/fa_time_vs_deltamax.png", width = 6, height = 4, dpi = 300)
+```

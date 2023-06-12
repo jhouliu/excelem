@@ -1,0 +1,12 @@
+Package: excelem
+Type: Package
+Title: Extrapolating Conditional Expectations to Accelerate EM Procedures
+Version: 0.0.1
+Author: Jason Hou-Liu
+Maintainer: Jason Hou-Liu <jhouliu@uwaterloo.ca>
+Description: Extrapolating Conditional Expectations to Accelerate EM Procedures
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+Depends: Rfast, SQUAREM
+RoxygenNote: 7.2.3
